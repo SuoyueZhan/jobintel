@@ -1,64 +1,222 @@
 import re
-from typing import Dict, List, Tuple
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Pattern, Sequence, Tuple
 
-# --- Keyword patterns (you can expand later) ---
 
-CLEARANCE_PATTERNS = [
-    r"\bsecurity clearance\b",
-    r"\bclearance\b",
-    r"\b(ts\/sci|ts-sci)\b",
-    r"\btop secret\b",
-    r"\bsecret clearance\b",
-]
+# -----------------------------
+# 1) Sentence splitting
+# -----------------------------
 
-CITIZENSHIP_PATTERNS = [
-    r"\b(u\.s\. citizen|us citizen|united states citizen)\b",
-    r"\b(u\.s\. citizenship|us citizenship)\b",
-    r"\bcitizenship\b",
-    r"\bonly\s+u\.s\.\s+citizens\b",
-    r"\bmust be (a )?u\.s\.\s+citizen\b",
-]
-
-# Very simple negation phrases (baseline only)
-NEGATION_PATTERNS = [
-    r"\bno clearance required\b",
-    r"\bclearance not required\b",
-    r"\bno u\.s\. citizenship required\b",
-    r"\bcitizenship not required\b",
-]
-
-# --- Helpers ---
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[\.\!\?])\s+|\n+", re.MULTILINE)
 
 
 def _split_sentences(text: str) -> List[str]:
     """
-    Split text into rough sentences.
-    Good enough for Day 4; we’ll improve later if needed.
+    Rough sentence splitter.
+    Evidence and negation scope are usually sentence-based in job descriptions.
     """
     text = (text or "").strip()
     if not text:
         return []
-    parts = re.split(r"(?<=[\.\!\?])\s+|\n+", text)
+    parts = _SENTENCE_SPLIT_RE.split(text)
     return [p.strip() for p in parts if p and p.strip()]
 
 
-def _find_evidence(
-    sentences: List[str], patterns: List[str], max_items: int = 5
+# -----------------------------
+# 2) Rule definition (rule table)
+# -----------------------------
+
+
+@dataclass(frozen=True)
+class RuleSpec:
+    """
+    A data-driven rule.
+
+    name:
+      The label name you want in hits (e.g. 'clearance', 'citizenship').
+
+    positive:
+      Regex patterns indicating a requirement.
+
+    negation_cues:
+      Words/phrases indicating negation near the positive match
+      (e.g. 'not required', 'no', 'without').
+
+    Notes:
+      - We keep negation cues generic; they’re applied with a window (scope).
+      - If you want, you can add 'priority' or 'weight' later.
+    """
+
+    name: str
+    positive: Sequence[Pattern[str]]
+    negation_cues: Sequence[Pattern[str]]
+
+
+def _compile_all(patterns: Sequence[str]) -> List[Pattern[str]]:
+    """
+    Compile patterns once.
+
+    Speed + catch regex bugs early + easier to test.
+    """
+    return [re.compile(p, flags=re.IGNORECASE) for p in patterns]
+
+
+# -----------------------------
+# 3) Patterns
+# -----------------------------
+
+CLEARANCE_POS = _compile_all(
+    [
+        r"\bsecurity clearance\b",
+        r"\bclearance\b",
+        r"\b(ts\/sci|ts-sci)\b",
+        r"\btop secret\b",
+        r"\bsecret clearance\b",
+    ]
+)
+
+CITIZENSHIP_POS = _compile_all(
+    [
+        r"\b(u\.s\. citizen|us citizen|united states citizen)\b",
+        r"\b(u\.s\. citizenship|us citizenship)\b",
+        r"\bcitizenship\b",
+        r"\bonly\s+u\.s\.\s+citizens\b",
+        r"\bmust be (a )?u\.s\.\s+citizen\b",
+    ]
+)
+
+# Generic negation cues (mechanism-based)
+# You can evolve this list over time; it’s not “enumerating sentences”.
+NEGATION_CUES = _compile_all(
+    [
+        r"\bno\b",
+        r"\bnot\b",
+        r"\bwithout\b",
+        r"\bdoes(?:n'?t)?\b",  # doesn't / does not
+        r"\bdo(?:n'?t)?\b",  # don't / do not
+        r"\bnot required\b",
+        r"\bno longer required\b",
+        r"\bnot necessary\b",
+        r"\bnot needed\b",
+        r"\bnot a requirement\b",
+        r"\bpreferred\b.*\bnot required\b",  # common phrasing: preferred but not required
+    ]
+)
+
+
+RULES: List[RuleSpec] = [
+    RuleSpec(name="clearance", positive=CLEARANCE_POS, negation_cues=NEGATION_CUES),
+    RuleSpec(name="citizenship", positive=CITIZENSHIP_POS, negation_cues=NEGATION_CUES),
+]
+
+
+# -----------------------------
+# 4) Negation window logic
+# -----------------------------
+
+_WORD_RE = re.compile(r"[A-Za-z0-9\.\-/]+")
+
+
+def _tokenize(sentence: str) -> List[str]:
+    """
+    Tokenize a sentence into rough 'words'.
+
+    Window-based negation (N words around a match) needs token positions.
+    """
+    return _WORD_RE.findall(sentence.lower())
+
+
+def _find_first_match_span(
+    sentence: str, patterns: Sequence[Pattern[str]]
+) -> Optional[Tuple[int, int]]:
+    """
+    Find the first regex match span (start, end) in the sentence for any pattern.
+    Returns None if no match.
+
+    We need a position to anchor the negation window.
+    """
+    for pat in patterns:
+        m = pat.search(sentence)
+        if m:
+            return (m.start(), m.end())
+    return None
+
+
+def _char_index_to_token_index(sentence: str, char_pos: int) -> int:
+    """
+    Convert a char index into a token index.
+
+    We find regex match spans in chars, but apply negation in token windows.
+    """
+    # Count how many tokens start before char_pos
+    idx = 0
+    for m in _WORD_RE.finditer(sentence):
+        if m.start() >= char_pos:
+            break
+        idx += 1
+    return idx
+
+
+def _is_negated(
+    sentence: str,
+    match_span: Tuple[int, int],
+    negation_cues: Sequence[Pattern[str]],
+    window_tokens: int = 6,
+) -> bool:
+    """
+    Determine if a positive match is negated in the same sentence.
+
+    Mechanism:
+    - locate match position in tokens
+    - look within +/- window_tokens for any negation cue match
+
+
+    - avoids global cancellation
+    - captures many phrasings without enumerating full sentences
+    """
+    tokens = _tokenize(sentence)
+    if not tokens:
+        return False
+
+    start_char, _ = match_span
+    anchor = _char_index_to_token_index(sentence, start_char)
+
+    left = max(0, anchor - window_tokens)
+    right = min(len(tokens), anchor + window_tokens + 1)
+    window_text = " ".join(tokens[left:right])
+
+    return any(cue.search(window_text) for cue in negation_cues)
+
+
+# -----------------------------
+# 5) Rule evaluation
+# -----------------------------
+
+
+def _collect_evidence_for_rule(
+    sentences: List[str], rule: RuleSpec, max_items: int = 5
 ) -> Tuple[bool, List[str]]:
     """
-    Return (flag, evidence_sentences).
-    Evidence sentences are the original sentence strings that match at least one pattern.
+    Return (flag, evidence_sentences) for a single rule.
+
+    Evidence policy:
+    - sentence is evidence if it matches positive pattern AND is not negated (per window)
+    - de-duplicate while preserving order
     """
     evidence: List[str] = []
     for s in sentences:
-        for pat in patterns:
-            if re.search(pat, s, flags=re.IGNORECASE):
-                evidence.append(s)
-                break
+        span = _find_first_match_span(s, rule.positive)
+        if not span:
+            continue
+
+        if _is_negated(s, span, rule.negation_cues, window_tokens=6):
+            continue
+
+        evidence.append(s)
         if len(evidence) >= max_items:
             break
 
-    # De-duplicate while preserving order
+    # De-duplicate preserving order
     seen = set()
     unique: List[str] = []
     for e in evidence:
@@ -71,48 +229,38 @@ def _find_evidence(
 
 def analyze_jd(text: str) -> Dict:
     """
-    Day-4 core function.
-    Input: JD text
-    Output: dict with requires_clearance/requires_citizenship/hits/evidence
+    Core function.
+
+    Output contract stays the same as your current implementation.
     """
     text = (text or "").strip()
     sentences = _split_sentences(text)
 
-    # quick negation check (very simple)
-    negated = any(re.search(p, text, flags=re.IGNORECASE) for p in NEGATION_PATTERNS)
-
-    clearance_flag, clearance_evi = _find_evidence(sentences, CLEARANCE_PATTERNS)
-    citizenship_flag, citizenship_evi = _find_evidence(sentences, CITIZENSHIP_PATTERNS)
-
-    # Conservative rule: if we see explicit "not required" phrases, prefer False
-    if negated:
-        # This is simplistic; later we can make it more precise per-sentence.
-        # For Day 4, it helps avoid obvious false positives.
-        clearance_flag = False if clearance_flag else clearance_flag
-        citizenship_flag = False if citizenship_flag else citizenship_flag
-
     hits: List[str] = []
-    evidence: List[str] = []
+    evidence_all: List[str] = []
 
-    if clearance_flag:
-        hits.append("clearance")
-        evidence.extend(clearance_evi)
+    results: Dict[str, Tuple[bool, List[str]]] = {}
 
-    if citizenship_flag:
-        hits.append("citizenship")
-        evidence.extend(citizenship_evi)
+    for rule in RULES:
+        flag, evidence = _collect_evidence_for_rule(sentences, rule, max_items=5)
+        results[rule.name] = (flag, evidence)
+
+        if flag:
+            hits.append(rule.name)
+            evidence_all.extend(evidence)
 
     # Final evidence de-dup + limit
     seen = set()
     evidence_unique: List[str] = []
-    for e in evidence:
+    for e in evidence_all:
         if e not in seen:
             seen.add(e)
             evidence_unique.append(e)
+    a = 1
 
     return {
-        "requires_clearance": clearance_flag,
-        "requires_citizenship": citizenship_flag,
+        "requires_clearance": results.get("clearance", (False, []))[0],
+        "requires_citizenship": results.get("citizenship", (False, []))[0],
         "hits": hits,
         "evidence": evidence_unique[:5],
     }
