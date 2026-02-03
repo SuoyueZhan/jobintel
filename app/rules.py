@@ -256,7 +256,6 @@ def analyze_jd(text: str) -> Dict:
         if e not in seen:
             seen.add(e)
             evidence_unique.append(e)
-    a = 1
 
     return {
         "requires_clearance": results.get("clearance", (False, []))[0],
