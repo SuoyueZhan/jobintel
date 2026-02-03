@@ -9,17 +9,43 @@ from typing import Dict, List, Optional, Pattern, Sequence, Tuple
 
 _SENTENCE_SPLIT_RE = re.compile(r"(?<=[\.\!\?])\s+|\n+", re.MULTILINE)
 
+# Matches abbreviations like "U.S." "U.S.A." "E.U." etc.
+_ABBREV_RE = re.compile(r"\b(?:[A-Za-z]\.){2,}")
+
+_DOT_PLACEHOLDER = "<DOT>"
+
 
 def _split_sentences(text: str) -> List[str]:
     """
-    Rough sentence splitter.
-    Evidence and negation scope are usually sentence-based in job descriptions.
+    Rough sentence splitter with abbreviation protection.
+
+    Why:
+    - Simple regex splitting treats 'U.S.' as sentence end.
+    - We protect multi-initial abbreviations (U.S., U.S.A., etc.) first.
     """
     text = (text or "").strip()
     if not text:
         return []
-    parts = _SENTENCE_SPLIT_RE.split(text)
-    return [p.strip() for p in parts if p and p.strip()]
+
+    # 1) Protect abbreviations by replacing '.' inside them
+    def _protect(m: re.Match) -> str:
+        return m.group(0).replace(".", _DOT_PLACEHOLDER)
+
+    protected = _ABBREV_RE.sub(_protect, text)
+
+    # 2) Split sentences
+    parts = _SENTENCE_SPLIT_RE.split(protected)
+
+    # 3) Restore dots and clean
+    out: List[str] = []
+    for p in parts:
+        p = (p or "").strip()
+        if not p:
+            continue
+        p = p.replace(_DOT_PLACEHOLDER, ".")
+        out.append(p)
+
+    return out
 
 
 # -----------------------------
@@ -50,6 +76,7 @@ class RuleSpec:
     name: str
     positive: Sequence[Pattern[str]]
     negation_cues: Sequence[Pattern[str]]
+    explicit_negatives: Sequence[Pattern[str]] = ()
 
 
 def _compile_all(patterns: Sequence[str]) -> List[Pattern[str]]:
@@ -103,12 +130,37 @@ NEGATION_CUES = _compile_all(
     ]
 )
 
+CLEARANCE_NEG_EXPLICIT = _compile_all(
+    [
+        r"\bno\s+clearance\s+required\b",
+        r"\bclearance\s+not\s+required\b",
+    ]
+)
 
-RULES: List[RuleSpec] = [
-    RuleSpec(name="clearance", positive=CLEARANCE_POS, negation_cues=NEGATION_CUES),
-    RuleSpec(name="citizenship", positive=CITIZENSHIP_POS, negation_cues=NEGATION_CUES),
+CITIZENSHIP_NEG_EXPLICIT = _compile_all(
+    [
+        r"\bno\s+u\.?\s*s\.?\s+citizenship\s+required\b",
+        r"\bno\s+u\.?\s*s\.?\s+citizen(?:ship)?\s+required\b",
+        r"\bno\s+citizenship\s+required\b",
+        r"\bcitizenship\s+not\s+required\b",
+    ]
+)
+
+
+RULES = [
+    RuleSpec(
+        name="clearance",
+        positive=CLEARANCE_POS,
+        negation_cues=NEGATION_CUES,
+        explicit_negatives=CLEARANCE_NEG_EXPLICIT,
+    ),
+    RuleSpec(
+        name="citizenship",
+        positive=CITIZENSHIP_POS,
+        negation_cues=NEGATION_CUES,
+        explicit_negatives=CITIZENSHIP_NEG_EXPLICIT,
+    ),
 ]
-
 
 # -----------------------------
 # 4) Negation window logic
@@ -203,12 +255,24 @@ def _collect_evidence_for_rule(
     - sentence is evidence if it matches positive pattern AND is not negated (per window)
     - de-duplicate while preserving order
     """
+
     evidence: List[str] = []
     for s in sentences:
+        if rule.name == "citizenship":
+            print("SENTENCE:", repr(s))
+            print("EXPL_NEG_MATCH:", any(p.search(s) for p in rule.explicit_negatives))
+
         span = _find_first_match_span(s, rule.positive)
         if not span:
             continue
 
+        # 1) Explicit negatives first (highest precision)
+        if rule.explicit_negatives and any(
+            p.search(s) for p in rule.explicit_negatives
+        ):
+            continue
+
+        # 2) Then window negation (more general)
         if _is_negated(s, span, rule.negation_cues, window_tokens=6):
             continue
 
